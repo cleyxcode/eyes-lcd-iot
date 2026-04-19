@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(groups $USER)",
+      "Bash(curl -s -w \"\\\\nStatus: %{http_code}\\\\n\" \"https://ml-api-qv8u.vercel.app/\")",
+      "Bash(curl -s -w \"\\\\nStatus: %{http_code}\\\\n\" \"https://ml-api-qv8u.vercel.app/sensor\")",
+      "Bash(curl -s -w \"\\\\nStatus: %{http_code}\\\\n\" \"https://ml-api-qv8u.vercel.app/docs\")",
+      "WebFetch(domain:ml-api-qv8u.vercel.app)",
+      "Bash(curl -s https://ml-api-qv8u.vercel.app/openapi.json)",
+      "Bash(curl -X POST https://ml-api-qv8u.vercel.app/sensor -H 'Content-Type: application/json' -d '{\"soil_moisture\": 38.0, \"temperature\": 32.7, \"air_humidity\": 73.0}' -w '\\\\nHTTP Status: %{http_code}\\\\n')"
+    ]
+  }
+}

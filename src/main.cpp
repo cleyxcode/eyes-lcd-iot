@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -7,456 +9,500 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>      // simpan WiFi ke flash (NVS)
-#include <WebServer.h>        // web portal provisioning
-#include <DNSServer.h>        // captive portal redirect
-#include "wifi_portal.h"      // HTML halaman setup WiFi
+#include <time.h>
+
+// ── Konfigurasi WiFi ───────────────────────────────────────────────────────
+#define WIFI_SSID "TP"
+#define WIFI_PASS "984038759"
 
 // ── Konfigurasi API ────────────────────────────────────────────────────────
-#define API_BASE_URL  "https://siram-pintar-api.onrender.com"
+#define API_BASE_URL "https://ml-api-flax.vercel.app"
+
+// !! GANTI DENGAN API KEY ANDA (5 karakter, huruf+angka)
+// Harus sama persis dengan nilai API_KEY di environment Vercel
+#define API_KEY "yuli1"
 
 // ── Pin ────────────────────────────────────────────────────────────────────
-#define RELAY_PIN     23
+#define RELAY_PIN    23
 #define DHT_PIN       4
-#define SOIL_PIN      35
-#define BTN_PIN       13
-#define DEBOUNCE_MS   50
+#define SOIL_PIN     35
+#define BTN_PIN      13
+#define DEBOUNCE_MS  50
 
 // ── OLED ───────────────────────────────────────────────────────────────────
 #define SCREEN_WIDTH  128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ── DHT22 ──────────────────────────────────────────────────────────────────
 DHT dht(DHT_PIN, DHT22);
 
 // ── Soil Moisture kalibrasi ────────────────────────────────────────────────
-#define SOIL_DRY_ADC  3200
-#define SOIL_WET_ADC  1200
+#define SOIL_DRY_ADC 2800
+#define SOIL_WET_ADC 1300
+#define SOIL_SAMPLES   10
 
-// ── WiFi Provisioning ──────────────────────────────────────────────────────
-#define AP_SSID       "Siram-Pintar-Setup"   // nama AP saat provisioning
-#define AP_PASS       ""                     // kosong = terbuka (mudah diakses)
-#define PREF_NS       "wifi"                 // namespace Preferences NVS
-#define WIFI_TIMEOUT  20                     // detik timeout koneksi WiFi
+// ── NTP (WIT = UTC+9) ──────────────────────────────────────────────────────
+const char* ntpServer        = "pool.ntp.org";
+const long  gmtOffset_sec    = 9 * 3600;
+const int   daylightOffset_sec = 0;
 
-Preferences preferences;
-WebServer   webServer(80);
-DNSServer   dnsServer;
-bool        isProvisioningMode = false;
+// ── Timing ─────────────────────────────────────────────────────────────────
+const unsigned long SENSOR_INTERVAL  =  2000UL;
+const unsigned long API_INTERVAL     = 30000UL;
+const unsigned long DISPLAY_INTERVAL =  1000UL;
+const unsigned long WIFI_CHECK_MS    = 10000UL;
+const unsigned long NTP_RESYNC_MS    = 3600000UL;
+
+unsigned long lastSensorRead   = 0;
+unsigned long lastApiSend      = 0;
+unsigned long lastDisplayUpdate= 0;
+unsigned long lastBtnTime      = 0;
+unsigned long lastWiFiCheck    = 0;
+unsigned long lastNtpSync      = 0;
+bool          lastBtnState     = HIGH;
 
 // ── Mode operasi ───────────────────────────────────────────────────────────
 enum Mode { AUTO, MANUAL };
 Mode mode = AUTO;
 
 // ── State ──────────────────────────────────────────────────────────────────
-bool    pumpOn         = false;
-bool    wifiConnected  = false;
-String  lastLabel      = "---";
-float   lastConfidence = 0.0;
+bool   pumpOn        = false;
+bool   wifiConnected = false;
+bool   ntpSynced     = false;
 
-// ── Timing ─────────────────────────────────────────────────────────────────
-unsigned long lastSensorRead    = 0;
-unsigned long lastApiSend       = 0;
-unsigned long lastDisplayUpdate = 0;
-unsigned long lastBtnTime       = 0;
-bool          lastBtnState      = HIGH;
+// Status koneksi API (termasuk auth)
+enum ApiStatus { API_UNKNOWN, API_OK, API_AUTH_ERR, API_ERR };
+ApiStatus apiStatus   = API_UNKNOWN;
+unsigned long lastApiSuccess = 0;  // Timestamp terakhir berhasil
 
-const unsigned long SENSOR_INTERVAL  = 2000;
-const unsigned long API_INTERVAL     = 5UL * 60000UL;
-const unsigned long DISPLAY_INTERVAL = 1000;
+String lastLabel     = "---";
+float  lastConfidence= 0.0;
+String lastAutoInfo  = "";
+
+const char* namaHari[] = {"Mgg","Sen","Sel","Rab","Kam","Jum","Sab"};
 
 // ── Data sensor ────────────────────────────────────────────────────────────
-float temperature  = NAN;
-float airHumidity  = NAN;
-int   soilRaw      = 0;
-float soilPct      = 0.0;
+float temperature = NAN;
+float airHumidity = NAN;
+int   soilRaw     = 0;
+float soilPct     = 0.0;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// WIFI PROVISIONING — Simpan / Muat Credentials
+// UTILITAS
 // ═══════════════════════════════════════════════════════════════════════════
-
-void saveWifiCredentials(const String& ssid, const String& pass) {
-  preferences.begin(PREF_NS, false);   // false = read-write
-  preferences.putString("ssid", ssid);
-  preferences.putString("pass", pass);
-  preferences.end();
-  Serial.printf("[NVS] Saved SSID: %s\n", ssid.c_str());
-}
-
-bool loadWifiCredentials(String& ssid, String& pass) {
-  preferences.begin(PREF_NS, true);    // true = read-only
-  ssid = preferences.getString("ssid", "");
-  pass = preferences.getString("pass", "");
-  preferences.end();
-  return ssid.length() > 0;
-}
-
-void clearWifiCredentials() {
-  preferences.begin(PREF_NS, false);
-  preferences.clear();
-  preferences.end();
-  Serial.println("[NVS] Credentials cleared");
-}
-
-// ── Coba konek WiFi dengan credentials ───────────────────────────────────
-bool tryConnect(const String& ssid, const String& pass) {
-  Serial.printf("[WiFi] Connecting to: %s\n", ssid.c_str());
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), pass.c_str());
-
-  for (int i = 0; i < WIFI_TIMEOUT * 2; i++) {
-    delay(500);
-    Serial.print(".");
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-      return true;
-    }
+int readSoilADC() {
+  long sum = 0;
+  for (int i = 0; i < SOIL_SAMPLES; i++) {
+    sum += analogRead(SOIL_PIN);
+    delay(5);
   }
-  Serial.println("\n[WiFi] Failed to connect.");
-  WiFi.disconnect(true);
-  return false;
+  return (int)(sum / SOIL_SAMPLES);
 }
-
-// ═══════════════════════════════════════════════════════════════════════════
-// WEB SERVER HANDLERS — Captive Portal
-// ═══════════════════════════════════════════════════════════════════════════
-
-// Kirim halaman HTML utama
-void handleRoot() {
-  webServer.send_P(200, "text/html", WIFI_PORTAL_HTML);
-}
-
-// Redirect semua path tidak dikenal → portal (captive portal behavior)
-void handleNotFound() {
-  webServer.sendHeader("Location", "http://192.168.4.1", true);
-  webServer.send(302, "text/plain", "");
-}
-
-// GET /scan — scan jaringan WiFi dan kembalikan JSON
-void handleScan() {
-  Serial.println("[Scan] Scanning WiFi networks...");
-  int n = WiFi.scanNetworks(false, true);  // false=sync, true=show hidden
-
-  String json = "[";
-  for (int i = 0; i < n; i++) {
-    if (i > 0) json += ",";
-    // Escape karakter spesial di SSID untuk JSON
-    String ssid = WiFi.SSID(i);
-    ssid.replace("\\", "\\\\");
-    ssid.replace("\"", "\\\"");
-    json += "{\"ssid\":\"" + ssid + "\","
-          + "\"rssi\":"    + WiFi.RSSI(i) + ","
-          + "\"secure\":"  + (WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false") + "}";
-  }
-  json += "]";
-
-  Serial.printf("[Scan] Found %d networks\n", n);
-  webServer.send(200, "application/json", json);
-}
-
-// POST /connect — terima ssid + password, coba konek, simpan jika berhasil
-void handleConnect() {
-  if (!webServer.hasArg("ssid")) {
-    webServer.send(400, "application/json", "{\"success\":false,\"message\":\"Parameter ssid diperlukan\"}");
-    return;
-  }
-
-  String ssid = webServer.arg("ssid");
-  String pass = webServer.arg("password");   // bisa kosong untuk jaringan terbuka
-
-  if (ssid.isEmpty()) {
-    webServer.send(400, "application/json", "{\"success\":false,\"message\":\"SSID tidak boleh kosong\"}");
-    return;
-  }
-
-  Serial.printf("[Connect] Attempting SSID: %s\n", ssid.c_str());
-
-  // Tampilkan di OLED selama proses koneksi
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setTextSize(1);
-  display.setCursor(10, 8);  display.println("Menghubungkan ke:");
-  display.setCursor(10, 22); display.println(ssid.substring(0, 18));
-  display.setCursor(10, 40); display.println("Harap tunggu...");
-  display.display();
-
-  bool ok = tryConnect(ssid, pass);
-
-  if (ok) {
-    // Simpan credentials ke flash
-    saveWifiCredentials(ssid, pass);
-
-    String ip  = WiFi.localIP().toString();
-    String res = "{\"success\":true,\"message\":\"Berhasil terhubung!\",\"ip\":\"" + ip + "\"}";
-    webServer.send(200, "application/json", res);
-
-    // Tampilkan sukses di OLED
-    display.clearDisplay();
-    display.setCursor(20, 8);  display.println("WiFi Terhubung!");
-    display.setCursor(10, 22); display.println("IP: " + ip);
-    display.setCursor(10, 38); display.println("Restart dalam 3s...");
-    display.display();
-
-    delay(3000);
-    ESP.restart();  // restart → load credentials dari NVS → mode normal
-  } else {
-    String res = "{\"success\":false,\"message\":\"Gagal terhubung. Periksa password dan coba lagi.\"}";
-    webServer.send(200, "application/json", res);
-
-    // Kembali ke mode AP setelah gagal
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-
-    display.clearDisplay();
-    display.setCursor(10, 8);  display.println("Koneksi Gagal!");
-    display.setCursor(10, 22); display.println("Periksa password");
-    display.setCursor(10, 36); display.println("WiFi Anda.");
-    display.setCursor(10, 50); display.println("AP: " + String(AP_SSID));
-    display.display();
-  }
-}
-
-// ── Tampilkan info provisioning di OLED ──────────────────────────────────
-void showProvisioningOLED() {
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setTextSize(1);
-  display.fillRect(0, 0, 128, 12, WHITE);
-  display.setTextColor(BLACK);
-  display.setCursor(20, 2); display.println("SETUP MODE");
-  display.setTextColor(WHITE);
-  display.setCursor(2, 16); display.println("Hubungkan HP ke WiFi:");
-  display.setTextSize(1);
-  display.setCursor(2, 28); display.println(AP_SSID);
-  display.drawLine(0, 38, 128, 38, WHITE);
-  display.setCursor(2, 42); display.println("Buka browser:");
-  display.setCursor(2, 52); display.println("192.168.4.1");
-  display.display();
-}
-
-// ── Mulai mode provisioning ───────────────────────────────────────────────
-void startProvisioningMode() {
-  isProvisioningMode = true;
-  Serial.printf("[Provision] Starting AP: %s\n", AP_SSID);
-
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
-  delay(500);
-
-  IPAddress apIP(192, 168, 4, 1);
-  Serial.printf("[Provision] AP IP: %s\n", apIP.toString().c_str());
-
-  // DNS Captive Portal — semua domain → 192.168.4.1
-  dnsServer.start(53, "*", apIP);
-
-  // Daftarkan route web server
-  webServer.on("/",        HTTP_GET,  handleRoot);
-  webServer.on("/scan",    HTTP_GET,  handleScan);
-  webServer.on("/connect", HTTP_POST, handleConnect);
-  webServer.onNotFound(handleNotFound);
-  webServer.begin();
-
-  showProvisioningOLED();
-  Serial.println("[Provision] Portal ready at 192.168.4.1");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// OPERASI NORMAL — Sensor, API, OLED, Button
-// ═══════════════════════════════════════════════════════════════════════════
 
 void setPump(bool on) {
   if (on == pumpOn) return;
   pumpOn = on;
   digitalWrite(RELAY_PIN, on ? LOW : HIGH);
-  Serial.printf("POMPA %s | Mode: %s | Tanah: %.1f%%\n",
+  Serial.printf("[POMPA] %s | Mode: %s | Tanah: %.1f%%\n",
                 on ? "ON" : "OFF",
                 mode == AUTO ? "AUTO" : "MANUAL",
                 soilPct);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// WIFI & NTP
+// ═══════════════════════════════════════════════════════════════════════════
+void syncNTP() {
+  Serial.println("[NTP] Sinkronisasi waktu WIT...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo, 10000)) {
+    ntpSynced   = true;
+    lastNtpSync = millis();
+    Serial.printf("[NTP] OK: %s %02d:%02d:%02d\n",
+                  namaHari[timeinfo.tm_wday],
+                  timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  } else {
+    ntpSynced = false;
+    Serial.println("[NTP] Gagal — server akan fallback waktu sendiri.");
+  }
+}
+
+bool connectWiFi() {
+  Serial.printf("[WiFi] Connecting: %s\n", WIFI_SSID);
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(2, 8);  display.println("Koneksi WiFi...");
+  display.setCursor(2, 22); display.println(WIFI_SSID);
+  display.display();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+    if (++attempt > 40) {
+      Serial.println("\n[WiFi] Gagal!");
+      display.clearDisplay();
+      display.setCursor(10, 24); display.println("WiFi Gagal!");
+      display.display();
+      return false;
+    }
+  }
+  Serial.printf("\n[WiFi] OK! IP: %s\n", WiFi.localIP().toString().c_str());
+  display.clearDisplay();
+  display.setCursor(10, 24); display.println("WiFi Terhubung!");
+  display.display();
+  delay(800);
+  return true;
+}
+
+void handleWiFiReconnect() {
+  unsigned long now = millis();
+  if (WiFi.status() != WL_CONNECTED && (now - lastWiFiCheck >= WIFI_CHECK_MS)) {
+    lastWiFiCheck = now;
+    wifiConnected = false;
+    ntpSynced     = false;
+    Serial.println("[WiFi] Reconnecting...");
+    WiFi.disconnect();
+    WiFi.reconnect();
+  }
+
+  if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
+    wifiConnected = true;
+    Serial.println("[WiFi] Reconnected! Resync NTP...");
+    syncNTP();
+  }
+
+  if (wifiConnected && ntpSynced && (now - lastNtpSync >= NTP_RESYNC_MS)) {
+    syncNTP();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// API — /sensor  (dengan X-API-Key header)
+// ═══════════════════════════════════════════════════════════════════════════
 bool sendToAPI() {
   if (WiFi.status() != WL_CONNECTED) return false;
+  if (ESP.getFreeHeap() < 30000) {
+    Serial.println("[API] Heap rendah, skip kirim.");
+    return false;
+  }
+
+  bool success = false;
+
+  for (int attempt = 1; attempt <= 2; attempt++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15);
+
+    HTTPClient http;
+    http.setTimeout(12000);
+    http.begin(client, String(API_BASE_URL) + "/sensor");
+    http.addHeader("Content-Type", "application/json");
+    // ── API Key header ──────────────────────────────────────────────────
+    http.addHeader("X-API-Key", API_KEY);
+
+    JsonDocument doc;
+    doc["soil_moisture"] = isnan(soilPct)     ? 0.0f : (float)(round(soilPct     * 10) / 10.0);
+    doc["temperature"]   = isnan(temperature) ? 0.0f : (float)(round(temperature * 10) / 10.0);
+    doc["air_humidity"]  = isnan(airHumidity) ? 0.0f : (float)(round(airHumidity * 10) / 10.0);
+
+    struct tm timeinfo;
+    if (ntpSynced && getLocalTime(&timeinfo)) {
+      doc["hour"]   = timeinfo.tm_hour;
+      doc["minute"] = timeinfo.tm_min;
+      doc["day"]    = timeinfo.tm_wday;
+    }
+
+    String body;
+    serializeJson(doc, body);
+    Serial.printf("[API] POST /sensor: %s\n", body.c_str());
+
+    int code = http.POST(body);
+
+    if (code == 200) {
+      String response = http.getString();
+      JsonDocument res;
+
+      if (!deserializeJson(res, response)) {
+        if (!res["classification"]["label"].isNull()) {
+          lastLabel      = res["classification"]["label"].as<String>();
+          lastConfidence = res["classification"]["confidence"].as<float>();
+        }
+        if (!res["pump_status"].isNull())
+          setPump(res["pump_status"].as<bool>());
+
+        if (!res["mode"].isNull()) {
+          String sMode = res["mode"].as<String>();
+          mode = (sMode == "auto") ? AUTO : MANUAL;
+        }
+
+        if (!res["auto_info"].isNull()) {
+          String reason  = res["auto_info"]["reason"].as<String>();
+          String blocked = res["auto_info"]["blocked_reason"].as<String>();
+          bool   raining = res["auto_info"]["is_raining"].as<bool>();
+          int    rscore  = res["auto_info"]["rain_score"].as<int>();
+
+          if (reason.length()  > 0) Serial.printf("[AUTO] %s\n", reason.c_str());
+          if (blocked.length() > 0) Serial.printf("[BLOKIR] %s\n", blocked.c_str());
+          if (raining)              Serial.printf("[HUJAN] skor=%d\n", rscore);
+
+          lastAutoInfo = blocked.length() > 0 ? blocked : reason;
+          if (lastAutoInfo.length() > 40) lastAutoInfo = lastAutoInfo.substring(0, 40);
+        }
+
+        if (!res["device_time"].isNull()) {
+          Serial.printf("[WAKTU] Server: %s (src: %s)\n",
+                        res["device_time"].as<String>().c_str(),
+                        res["time_source"].as<String>().c_str());
+        }
+      }
+
+      apiStatus    = API_OK;
+      lastApiSuccess = millis();
+      success      = true;
+      Serial.printf("[API] OK | Pompa: %s | Label: %s (%.0f%%)\n",
+                    pumpOn ? "ON" : "OFF", lastLabel.c_str(), lastConfidence);
+
+    } else if (code == 401) {
+      // API key salah / tidak ada
+      apiStatus = API_AUTH_ERR;
+      Serial.printf("[API] 401 UNAUTHORIZED — periksa API_KEY '%s'\n", API_KEY);
+      http.end();
+      break;  // Jangan retry, key memang salah
+
+    } else {
+      apiStatus = API_ERR;
+      Serial.printf("[API] Gagal attempt %d, code: %d\n", attempt, code);
+    }
+
+    http.end();
+    if (success) break;
+    if (attempt < 2) delay(3000);
+  }
+  return success;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// API — /control  (dengan X-API-Key header)
+// ═══════════════════════════════════════════════════════════════════════════
+void sendControlToAPI(bool on, Mode requestedMode) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (ESP.getFreeHeap() < 30000) return;
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setTimeout(15);
+
   HTTPClient http;
-  String url = String(API_BASE_URL) + "/sensor";
-  http.begin(client, url);
+  http.setTimeout(12000);
+  http.begin(client, String(API_BASE_URL) + "/control");
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", API_KEY);   // ── API Key header ──
 
   JsonDocument doc;
-  doc["soil_moisture"] = soilPct;
-  doc["temperature"]   = isnan(temperature) ? 0 : temperature;
-  doc["air_humidity"]  = isnan(airHumidity)  ? 0 : airHumidity;
+  doc["action"] = on ? "on" : "off";
+  doc["mode"]   = (requestedMode == MANUAL) ? "manual" : "auto";
 
   String body;
   serializeJson(doc, body);
+  Serial.printf("[CONTROL] POST: %s\n", body.c_str());
+
   int code = http.POST(body);
 
   if (code == 200) {
     String response = http.getString();
     JsonDocument res;
     if (!deserializeJson(res, response)) {
-      lastLabel      = res["classification"]["label"].as<String>();
-      lastConfidence = res["classification"]["confidence"].as<float>();
-      if (mode == AUTO) {
-        String action = res["pump_action"].as<String>();
-        if (action == "on")  setPump(true);
-        if (action == "off") setPump(false);
+      if (!res["pump_status"].isNull()) {
+        bool serverPump = res["pump_status"].as<bool>();
+        if (serverPump != pumpOn) {
+          setPump(serverPump);
+          Serial.printf("[CONTROL] Server koreksi pompa → %s\n", serverPump ? "ON" : "OFF");
+        }
       }
-      Serial.printf("API OK | Label: %s (%.1f%%)\n", lastLabel.c_str(), lastConfidence);
+      if (!res["mode"].isNull()) {
+        String sMode = res["mode"].as<String>();
+        mode = (sMode == "auto") ? AUTO : MANUAL;
+      }
+      bool debounced = res["debounced"] | false;
+      if (debounced) Serial.println("[CONTROL] Perintah duplikat diabaikan server.");
+      apiStatus = API_OK;
     }
-    http.end();
-    return true;
+  } else if (code == 401) {
+    apiStatus = API_AUTH_ERR;
+    Serial.println("[CONTROL] 401 UNAUTHORIZED — periksa API_KEY!");
+  } else {
+    Serial.printf("[CONTROL] Gagal, code: %d\n", code);
   }
-  Serial.printf("API gagal: HTTP %d\n", code);
-  http.end();
-  return false;
-}
-
-void sendControlToAPI(bool on) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  String url = String(API_BASE_URL) + "/control";
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  JsonDocument doc;
-  doc["action"] = on ? "on" : "off";
-  doc["mode"]   = mode == MANUAL ? "manual" : "auto";
-  String body;
-  serializeJson(doc, body);
-  http.POST(body);
   http.end();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// DISPLAY — UI yang ditingkatkan
+// ═══════════════════════════════════════════════════════════════════════════
 void updateDisplay() {
   display.clearDisplay();
+
+  struct tm timeinfo;
+  bool hasTime = ntpSynced && getLocalTime(&timeinfo);
+  char timeStr[16];
+  if (hasTime)
+    sprintf(timeStr, "%s %02d:%02d", namaHari[timeinfo.tm_wday],
+            timeinfo.tm_hour, timeinfo.tm_min);
+  else
+    strcpy(timeStr, "No NTP");
+
+  // ── 1. Header bar ──────────────────────────────────────────────────────
   display.fillRect(0, 0, 128, 12, WHITE);
   display.setTextColor(BLACK);
   display.setTextSize(1);
   display.setCursor(2, 2);
-  display.print("POMPA:");
-  display.print(pumpOn ? "ON " : "OFF");
-  display.setCursor(58, 2);
-  display.print(mode == AUTO ? "[AUTO]" : "[MAN] ");
-  if (wifiConnected) { display.setCursor(112, 2); display.print("W"); }
+  display.print(timeStr);
 
+  // Status API: OK/ERR/401 di pojok kanan header (menggantikan huruf W)
+  display.setCursor(100, 2);
+  switch (apiStatus) {
+    case API_OK:
+      display.print("OK");
+      break;
+    case API_AUTH_ERR:
+      display.print("401");   // API key salah
+      break;
+    case API_ERR:
+      display.print("ERR");
+      break;
+    default:
+      // API_UNKNOWN: tampilkan WiFi status saja
+      display.print(wifiConnected ? "W" : "--");
+      break;
+  }
+
+  // ── 2. Suhu & RH ──────────────────────────────────────────────────────
   display.setTextColor(WHITE);
-  display.setCursor(2, 14);
-  if (isnan(temperature)) display.print("--.-C");
+  display.setCursor(2, 15);
+  display.print("T:");
+  if (isnan(temperature)) display.print("ERR");
   else { display.print(temperature, 1); display.print("C"); }
-  display.setCursor(68, 14);
-  display.print("RH:");
-  if (isnan(airHumidity)) display.print("--");
-  else display.print(airHumidity, 0);
-  display.print("%");
 
-  display.drawLine(0, 24, 128, 24, WHITE);
-  display.setCursor(2, 27);
-  display.print("TANAH: ");
+  display.setCursor(68, 15);
+  display.print("RH:");
+  if (isnan(airHumidity)) display.print("ERR");
+  else { display.print(airHumidity, 0); display.print("%"); }
+
+  // ── 3. Tanah ──────────────────────────────────────────────────────────
+  display.setCursor(2, 25);
+  display.print("Tanah:");
   display.print(soilPct, 1);
   display.print("%");
 
-  display.drawRect(0, 37, 128, 10, WHITE);
-  int fillW = constrain((int)map((long)soilPct, 0, 100, 0, 126), 0, 126);
-  if (fillW > 0) display.fillRect(1, 38, fillW, 8, WHITE);
+  // ── 4. Progress bar tanah ─────────────────────────────────────────────
+  display.drawRect(0, 34, 128, 6, WHITE);
+  int fillW = (int)map(constrain((long)soilPct, 0, 100), 0, 100, 0, 124);
+  if (fillW > 0) display.fillRect(2, 36, fillW, 2, WHITE);
 
-  display.setCursor(2, 50);
-  display.print("KNN: ");
-  display.print(lastLabel);
-  if (lastConfidence > 0) {
-    display.print(" ");
-    display.print((int)lastConfidence);
-    display.print("%");
+  // ── 5. Mode & Status Pompa ────────────────────────────────────────────
+  display.setCursor(2, 43);
+  display.print(mode == AUTO ? "AUTO" : "MAN");
+  display.print("|Pmp:");
+  if (pumpOn) {
+    display.fillRect(72, 42, 54, 9, WHITE);
+    display.setTextColor(BLACK);
+    display.setCursor(76, 43);
+    display.print("ON  ");
+    display.setTextColor(WHITE);
+  } else {
+    display.print("OFF");
   }
+
+  // ── 6. Label KNN ──────────────────────────────────────────────────────
+  display.setCursor(2, 54);
+  display.print(lastLabel.substring(0, 7));
+  display.print(" ");
+  display.print((int)lastConfidence);
+  display.print("%");
+
+  // ── 7. Indikator koneksi API (pojok kanan bawah) ──────────────────────
+  // Lingkaran kecil: terisi = API OK, kosong = error
+  if (apiStatus == API_OK) {
+    display.fillCircle(123, 58, 3, WHITE);
+  } else if (apiStatus == API_AUTH_ERR) {
+    // X kecil untuk 401
+    display.drawLine(119, 54, 127, 62, WHITE);
+    display.drawLine(127, 54, 119, 62, WHITE);
+  } else {
+    display.drawCircle(123, 58, 3, WHITE);
+  }
+
   display.display();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BUTTON
+// ═══════════════════════════════════════════════════════════════════════════
 void checkButton() {
-  bool state = digitalRead(BTN_PIN);
+  bool      state = digitalRead(BTN_PIN);
   unsigned long now = millis();
 
   if (state == LOW && lastBtnState == HIGH && (now - lastBtnTime) > DEBOUNCE_MS) {
     lastBtnTime = now;
-    if (mode == AUTO) {
-      mode = MANUAL;
-      setPump(!pumpOn);
-    } else {
-      setPump(!pumpOn);
-    }
-    sendControlToAPI(pumpOn);
+    mode = MANUAL;
+    setPump(!pumpOn);
+    sendControlToAPI(pumpOn, MANUAL);
+    Serial.printf("[BTN] Toggle pompa → %s (MANUAL)\n", pumpOn ? "ON" : "OFF");
   }
-  if (state == LOW && (now - lastBtnTime) > 2000 && mode == MANUAL) {
+
+  if (state == LOW && lastBtnState == LOW &&
+      (now - lastBtnTime) > 2000 && mode == MANUAL) {
+    lastBtnTime = now;
     mode = AUTO;
-    Serial.println("Kembali ke mode AUTO");
+    Serial.println("[BTN] Tahan → kembali AUTO");
+    sendControlToAPI(pumpOn, AUTO);
   }
+
   lastBtnState = state;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SETUP & LOOP
+// SETUP
 // ═══════════════════════════════════════════════════════════════════════════
-
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
-  Serial.println("\n=== SIRAM PINTAR BOOTING ===");
+  Serial.println("\n=== SIRAM PINTAR v6 BOOTING ===");
+  Serial.printf("[AUTH] API Key: %s\n", API_KEY);
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);  // relay OFF default (active-low)
-  pinMode(SOIL_PIN, INPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+  analogSetAttenuation(ADC_11db);
+  analogReadResolution(12);
   pinMode(BTN_PIN, INPUT_PULLUP);
 
   dht.begin();
   Wire.begin();
   Wire.setClock(400000);
 
-  // OLED init
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED gagal!");
-    while (true);
+    Serial.println("[ERROR] OLED gagal!");
+    while (true) delay(1000);
   }
 
-  // Splash screen
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.setTextSize(1);
   display.setCursor(18, 8);  display.println("SIRAM PINTAR");
-  display.setCursor(12, 22); display.println("IoT + KNN Model");
+  display.setCursor(12, 22); display.println("IoT + KNN v6");
   display.setCursor(20, 38); display.println("Memuat...");
   display.display();
-  delay(1000);
+  delay(1500);
 
-  // ── Cek credentials tersimpan ─────────────────────────────────────────
-  String savedSSID, savedPass;
-  bool hasCredentials = loadWifiCredentials(savedSSID, savedPass);
+  wifiConnected = connectWiFi();
+  if (wifiConnected) syncNTP();
 
-  if (hasCredentials) {
-    Serial.printf("[Boot] Found saved SSID: %s — trying to connect\n", savedSSID.c_str());
-
-    display.clearDisplay();
-    display.setCursor(2, 8);  display.println("Menghubungkan WiFi:");
-    display.setCursor(2, 22); display.println(savedSSID.substring(0, 20));
-    display.setCursor(2, 38); display.println("Harap tunggu...");
-    display.display();
-
-    wifiConnected = tryConnect(savedSSID, savedPass);
-  }
-
-  if (!wifiConnected) {
-    // ── Tidak ada credentials atau koneksi gagal → Provisioning Mode ──
-    Serial.println("[Boot] No WiFi → starting provisioning portal");
-    startProvisioningMode();
-    return;   // loop() akan handle portal
-  }
-
-  // ── Koneksi berhasil → Mode Normal ────────────────────────────────────
-  Serial.println("[Boot] WiFi OK → normal mode");
-
-  // Warmup DHT22
   delay(2000);
   for (int i = 0; i < 5; i++) {
     temperature = dht.readTemperature();
@@ -465,25 +511,21 @@ void setup() {
     delay(500);
   }
 
-  soilRaw = analogRead(SOIL_PIN);
+  soilRaw = readSoilADC();
   soilPct = constrain(map(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100), 0, 100);
+  delay(500);
 
-  Serial.printf("[Init] Suhu:%.1fC RH:%.0f%% Tanah:%.1f%%\n", temperature, airHumidity, soilPct);
-  sendToAPI();
+  if (wifiConnected) sendToAPI();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════════════════════════════════════════
 void loop() {
-  // ── Mode Provisioning ─────────────────────────────────────────────────
-  if (isProvisioningMode) {
-    dnsServer.processNextRequest();   // captive portal DNS
-    webServer.handleClient();         // web server HTTP
-    return;
-  }
-
-  // ── Mode Normal ───────────────────────────────────────────────────────
   unsigned long now = millis();
 
   checkButton();
+  handleWiFiReconnect();
 
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     lastSensorRead = now;
@@ -491,20 +533,19 @@ void loop() {
     float h = dht.readHumidity();
     if (!isnan(t)) temperature = t;
     if (!isnan(h)) airHumidity = h;
-    soilRaw = analogRead(SOIL_PIN);
+    soilRaw = readSoilADC();
     soilPct = constrain(map(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100), 0, 100);
 
-    // Fallback lokal jika WiFi putus
     if (mode == AUTO && WiFi.status() != WL_CONNECTED) {
-      if (!pumpOn && soilPct < 40.0) setPump(true);
-      else if (pumpOn && soilPct > 70.0) setPump(false);
+      if (!pumpOn && soilPct <= 40.0f) setPump(true);
+      else if (pumpOn && soilPct >= 70.0f) setPump(false);
     }
   }
 
   if (now - lastApiSend >= API_INTERVAL) {
-    lastApiSend = now;
+    lastApiSend   = now;
     wifiConnected = (WiFi.status() == WL_CONNECTED);
-    sendToAPI();
+    if (wifiConnected) sendToAPI();
   }
 
   if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
