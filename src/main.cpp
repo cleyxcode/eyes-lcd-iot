@@ -23,11 +23,18 @@
 #define API_KEY "yuli1"
 
 // ── Pin ────────────────────────────────────────────────────────────────────
-#define RELAY_PIN    23
+// DIUBAH: RELAY_PIN dari 23 → 25 (sesuai hardware baru)
+#define RELAY_PIN    25
 #define DHT_PIN       4
 #define SOIL_PIN     35
 #define BTN_PIN      13
 #define DEBOUNCE_MS  50
+
+// DIUBAH: Definisi logika relay — HIGH = ON, LOW = OFF
+// Kode lama pakai logika terbalik (LOW=ON, HIGH=OFF)
+// Kode baru sesuai relay pin 25 yang aktif HIGH
+#define RELAY_ON  HIGH
+#define RELAY_OFF LOW
 
 // ── OLED ───────────────────────────────────────────────────────────────────
 #define SCREEN_WIDTH  128
@@ -75,7 +82,7 @@ bool   ntpSynced     = false;
 // Status koneksi API (termasuk auth)
 enum ApiStatus { API_UNKNOWN, API_OK, API_AUTH_ERR, API_ERR };
 ApiStatus apiStatus   = API_UNKNOWN;
-unsigned long lastApiSuccess = 0;  // Timestamp terakhir berhasil
+unsigned long lastApiSuccess = 0;
 
 String lastLabel     = "---";
 float  lastConfidence= 0.0;
@@ -101,10 +108,13 @@ int readSoilADC() {
   return (int)(sum / SOIL_SAMPLES);
 }
 
+// DIUBAH: setPump() sekarang pakai RELAY_ON / RELAY_OFF
+// Kode lama: digitalWrite(RELAY_PIN, on ? LOW : HIGH)  — logika terbalik
+// Kode baru: digitalWrite(RELAY_PIN, on ? RELAY_ON : RELAY_OFF) — logika benar
 void setPump(bool on) {
   if (on == pumpOn) return;
   pumpOn = on;
-  digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  digitalWrite(RELAY_PIN, on ? RELAY_ON : RELAY_OFF);
   Serial.printf("[POMPA] %s | Mode: %s | Tanah: %.1f%%\n",
                 on ? "ON" : "OFF",
                 mode == AUTO ? "AUTO" : "MANUAL",
@@ -203,7 +213,6 @@ bool sendToAPI() {
     http.setTimeout(12000);
     http.begin(client, String(API_BASE_URL) + "/sensor");
     http.addHeader("Content-Type", "application/json");
-    // ── API Key header ──────────────────────────────────────────────────
     http.addHeader("X-API-Key", API_KEY);
 
     JsonDocument doc;
@@ -262,18 +271,17 @@ bool sendToAPI() {
         }
       }
 
-      apiStatus    = API_OK;
+      apiStatus      = API_OK;
       lastApiSuccess = millis();
-      success      = true;
+      success        = true;
       Serial.printf("[API] OK | Pompa: %s | Label: %s (%.0f%%)\n",
                     pumpOn ? "ON" : "OFF", lastLabel.c_str(), lastConfidence);
 
     } else if (code == 401) {
-      // API key salah / tidak ada
       apiStatus = API_AUTH_ERR;
       Serial.printf("[API] 401 UNAUTHORIZED — periksa API_KEY '%s'\n", API_KEY);
       http.end();
-      break;  // Jangan retry, key memang salah
+      break;
 
     } else {
       apiStatus = API_ERR;
@@ -302,7 +310,7 @@ void sendControlToAPI(bool on, Mode requestedMode) {
   http.setTimeout(12000);
   http.begin(client, String(API_BASE_URL) + "/control");
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", API_KEY);   // ── API Key header ──
+  http.addHeader("X-API-Key", API_KEY);
 
   JsonDocument doc;
   doc["action"] = on ? "on" : "off";
@@ -343,7 +351,7 @@ void sendControlToAPI(bool on, Mode requestedMode) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DISPLAY — UI yang ditingkatkan
+// DISPLAY
 // ═══════════════════════════════════════════════════════════════════════════
 void updateDisplay() {
   display.clearDisplay();
@@ -364,22 +372,12 @@ void updateDisplay() {
   display.setCursor(2, 2);
   display.print(timeStr);
 
-  // Status API: OK/ERR/401 di pojok kanan header (menggantikan huruf W)
   display.setCursor(100, 2);
   switch (apiStatus) {
-    case API_OK:
-      display.print("OK");
-      break;
-    case API_AUTH_ERR:
-      display.print("401");   // API key salah
-      break;
-    case API_ERR:
-      display.print("ERR");
-      break;
-    default:
-      // API_UNKNOWN: tampilkan WiFi status saja
-      display.print(wifiConnected ? "W" : "--");
-      break;
+    case API_OK:       display.print("OK");  break;
+    case API_AUTH_ERR: display.print("401"); break;
+    case API_ERR:      display.print("ERR"); break;
+    default:           display.print(wifiConnected ? "W" : "--"); break;
   }
 
   // ── 2. Suhu & RH ──────────────────────────────────────────────────────
@@ -427,11 +425,9 @@ void updateDisplay() {
   display.print("%");
 
   // ── 7. Indikator koneksi API (pojok kanan bawah) ──────────────────────
-  // Lingkaran kecil: terisi = API OK, kosong = error
   if (apiStatus == API_OK) {
     display.fillCircle(123, 58, 3, WHITE);
   } else if (apiStatus == API_AUTH_ERR) {
-    // X kecil untuk 401
     display.drawLine(119, 54, 127, 62, WHITE);
     display.drawLine(127, 54, 119, 62, WHITE);
   } else {
@@ -477,7 +473,11 @@ void setup() {
   Serial.printf("[AUTH] API Key: %s\n", API_KEY);
 
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
+  // DIUBAH: kondisi awal relay menggunakan RELAY_OFF (LOW)
+  // Kode lama: digitalWrite(RELAY_PIN, HIGH) — sama artinya tapi tidak konsisten
+  // Kode baru: pakai konstanta RELAY_OFF agar jelas dan konsisten
+  digitalWrite(RELAY_PIN, RELAY_OFF);
+
   analogSetAttenuation(ADC_11db);
   analogReadResolution(12);
   pinMode(BTN_PIN, INPUT_PULLUP);
