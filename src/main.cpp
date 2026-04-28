@@ -1,3 +1,24 @@
+/*
+ * ╔══════════════════════════════════════════════════════════════════════╗
+ * ║           SIRAM PINTAR — ESP32 Firmware v6.2.0                      ║
+ * ╠══════════════════════════════════════════════════════════════════════╣
+ * ║  Changelog v6.2.0:                                                  ║
+ * ║  - [BUG FIX] Tambah polling ringan GET /pump-status setiap 5 detik  ║
+ * ║    agar delay kontrol turun dari ~30 detik menjadi max 5 detik      ║
+ * ║  - [BUG FIX] Sinkronisasi pump_status & mode dari /pump-status      ║
+ * ║    tanpa harus menunggu interval /sensor berikutnya                 ║
+ * ║  - [REMOVE] Hapus tombol fisik (BTN_PIN 13) — tidak digunakan lagi  ║
+ * ║  - [IMPROVE] Tambah field manual_override di respons display         ║
+ * ║  - [IMPROVE] Indikator override aktif ditampilkan di OLED            ║
+ * ╠══════════════════════════════════════════════════════════════════════╣
+ * ║  Hardware:                                                           ║
+ * ║    RELAY_PIN  = 25 (aktif HIGH)                                     ║
+ * ║    DHT_PIN    = 4  (DHT22)                                          ║
+ * ║    SOIL_PIN   = 35 (ADC)                                            ║
+ * ║    OLED       = I2C 0x3C (SSD1306 128x64)                          ║
+ * ╚══════════════════════════════════════════════════════════════════════╝
+ */
+
 #include <Arduino.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -11,90 +32,85 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
-// ── Konfigurasi WiFi ───────────────────────────────────────────────────────
+// ── Konfigurasi WiFi ──────────────────────────────────────────────────────
 #define WIFI_SSID "TP"
 #define WIFI_PASS "984038759"
 
-// ── Konfigurasi API ────────────────────────────────────────────────────────
+// ── Konfigurasi API ───────────────────────────────────────────────────────
 #define API_BASE_URL "https://ml-api-flax.vercel.app"
+#define API_KEY      "yuli1"
+#define FW_VERSION   "6.2.0"
 
-// !! GANTI DENGAN API KEY ANDA (5 karakter, huruf+angka)
-// Harus sama persis dengan nilai API_KEY di environment Vercel
-#define API_KEY "yuli1"
+// ── Pin ───────────────────────────────────────────────────────────────────
+#define RELAY_PIN  25
+#define DHT_PIN     4
+#define SOIL_PIN   35
 
-// ── Pin ────────────────────────────────────────────────────────────────────
-// DIUBAH: RELAY_PIN dari 23 → 25 (sesuai hardware baru)
-#define RELAY_PIN    25
-#define DHT_PIN       4
-#define SOIL_PIN     35
-#define BTN_PIN      13
-#define DEBOUNCE_MS  50
+// Logika relay: aktif HIGH
+#define RELAY_ON   HIGH
+#define RELAY_OFF  LOW
 
-// DIUBAH: Definisi logika relay — HIGH = ON, LOW = OFF
-// Kode lama pakai logika terbalik (LOW=ON, HIGH=OFF)
-// Kode baru sesuai relay pin 25 yang aktif HIGH
-#define RELAY_ON  HIGH
-#define RELAY_OFF LOW
-
-// ── OLED ───────────────────────────────────────────────────────────────────
+// ── OLED ──────────────────────────────────────────────────────────────────
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ── DHT22 ──────────────────────────────────────────────────────────────────
+// ── DHT22 ─────────────────────────────────────────────────────────────────
 DHT dht(DHT_PIN, DHT22);
 
-// ── Soil Moisture kalibrasi ────────────────────────────────────────────────
+// ── Soil Moisture kalibrasi ───────────────────────────────────────────────
 #define SOIL_DRY_ADC 2800
 #define SOIL_WET_ADC 1300
 #define SOIL_SAMPLES   10
 
-// ── NTP (WIT = UTC+9) ──────────────────────────────────────────────────────
-const char* ntpServer        = "pool.ntp.org";
-const long  gmtOffset_sec    = 9 * 3600;
+// ── NTP (WIT = UTC+9) ─────────────────────────────────────────────────────
+const char* ntpServer         = "pool.ntp.org";
+const long  gmtOffset_sec     = 9 * 3600;
 const int   daylightOffset_sec = 0;
 
-// ── Timing ─────────────────────────────────────────────────────────────────
-const unsigned long SENSOR_INTERVAL  =  2000UL;
-const unsigned long API_INTERVAL     = 30000UL;
-const unsigned long DISPLAY_INTERVAL =  1000UL;
-const unsigned long WIFI_CHECK_MS    = 10000UL;
-const unsigned long NTP_RESYNC_MS    = 3600000UL;
+// ── Timing ────────────────────────────────────────────────────────────────
+// [v6.2.0] STATUS_INTERVAL (5 detik) untuk polling /pump-status
+// Ini menggantikan kebutuhan button: perubahan state dari server
+// akan terdeteksi dalam max 5 detik, bukan 30 detik.
+const unsigned long SENSOR_INTERVAL  = 30000UL;  // kirim data sensor ke /sensor
+const unsigned long STATUS_INTERVAL  =  5000UL;  // [v6.2.0] poll /pump-status
+const unsigned long DISPLAY_INTERVAL =  1000UL;  // refresh layar OLED
+const unsigned long WIFI_CHECK_MS    = 10000UL;  // cek koneksi WiFi
+const unsigned long NTP_RESYNC_MS    = 3600000UL; // resync NTP tiap 1 jam
 
-unsigned long lastSensorRead   = 0;
-unsigned long lastApiSend      = 0;
-unsigned long lastDisplayUpdate= 0;
-unsigned long lastBtnTime      = 0;
-unsigned long lastWiFiCheck    = 0;
-unsigned long lastNtpSync      = 0;
-bool          lastBtnState     = HIGH;
+unsigned long lastSensorRead    = 0;
+unsigned long lastStatusCheck   = 0;  // [v6.2.0]
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastWiFiCheck     = 0;
+unsigned long lastNtpSync       = 0;
 
-// ── Mode operasi ───────────────────────────────────────────────────────────
+// ── Mode operasi ──────────────────────────────────────────────────────────
 enum Mode { AUTO, MANUAL };
 Mode mode = AUTO;
 
-// ── State ──────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────
 bool   pumpOn        = false;
 bool   wifiConnected = false;
 bool   ntpSynced     = false;
+bool   manualOverride = false;  // [v6.2.0] sinkronisasi dari server
 
-// Status koneksi API (termasuk auth)
 enum ApiStatus { API_UNKNOWN, API_OK, API_AUTH_ERR, API_ERR };
-ApiStatus apiStatus   = API_UNKNOWN;
+ApiStatus apiStatus    = API_UNKNOWN;
 unsigned long lastApiSuccess = 0;
 
-String lastLabel     = "---";
-float  lastConfidence= 0.0;
-String lastAutoInfo  = "";
+String lastLabel      = "---";
+float  lastConfidence = 0.0;
+String lastAutoInfo   = "";
 
 const char* namaHari[] = {"Mgg","Sen","Sel","Rab","Kam","Jum","Sab"};
 
-// ── Data sensor ────────────────────────────────────────────────────────────
+// ── Data sensor ───────────────────────────────────────────────────────────
 float temperature = NAN;
 float airHumidity = NAN;
 int   soilRaw     = 0;
 float soilPct     = 0.0;
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UTILITAS
@@ -108,9 +124,6 @@ int readSoilADC() {
   return (int)(sum / SOIL_SAMPLES);
 }
 
-// DIUBAH: setPump() sekarang pakai RELAY_ON / RELAY_OFF
-// Kode lama: digitalWrite(RELAY_PIN, on ? LOW : HIGH)  — logika terbalik
-// Kode baru: digitalWrite(RELAY_PIN, on ? RELAY_ON : RELAY_OFF) — logika benar
 void setPump(bool on) {
   if (on == pumpOn) return;
   pumpOn = on;
@@ -120,6 +133,7 @@ void setPump(bool on) {
                 mode == AUTO ? "AUTO" : "MANUAL",
                 soilPct);
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // WIFI & NTP
@@ -192,8 +206,75 @@ void handleWiFiReconnect() {
   }
 }
 
+
 // ═══════════════════════════════════════════════════════════════════════════
-// API — /sensor  (dengan X-API-Key header)
+// [v6.2.0] API — GET /pump-status (polling ringan setiap 5 detik)
+// Endpoint ini sangat ringan: tidak ada KNN, tidak ada logika watering.
+// Hanya mengembalikan pump_status, mode, dan manual_override.
+// Ini yang menggantikan kebutuhan button fisik — kontrol tetap dari server.
+// ═══════════════════════════════════════════════════════════════════════════
+void checkPumpStatus() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (ESP.getFreeHeap() < 25000) {
+    Serial.println("[STATUS] Heap rendah, skip poll.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(8);
+
+  HTTPClient http;
+  http.setTimeout(6000);
+  http.begin(client, String(API_BASE_URL) + "/pump-status");
+  http.addHeader("X-API-Key", API_KEY);
+
+  int code = http.GET();
+
+  if (code == 200) {
+    String response = http.getString();
+    JsonDocument res;
+
+    if (!deserializeJson(res, response)) {
+      bool  serverPump = res["pump_status"] | pumpOn;
+      String sMode     = res["mode"] | (mode == AUTO ? "auto" : "manual");
+      bool  overrideOn = res["manual_override"] | false;
+
+      // Update mode
+      Mode newMode = (sMode == "auto") ? AUTO : MANUAL;
+      if (newMode != mode) {
+        mode = newMode;
+        Serial.printf("[STATUS] Mode berubah → %s\n", mode == AUTO ? "AUTO" : "MANUAL");
+      }
+
+      // Update manual override flag
+      manualOverride = overrideOn;
+
+      // Sinkronisasi relay jika pump_status berubah
+      if (serverPump != pumpOn) {
+        setPump(serverPump);
+        Serial.printf("[STATUS] pump_status sinkron dari server → %s\n",
+                      serverPump ? "ON" : "OFF");
+      }
+
+      apiStatus = API_OK;
+      lastApiSuccess = millis();
+    }
+
+  } else if (code == 401) {
+    apiStatus = API_AUTH_ERR;
+    Serial.printf("[STATUS] 401 UNAUTHORIZED — periksa API_KEY '%s'\n", API_KEY);
+  } else if (code > 0) {
+    // Gagal tapi tidak fatal — cukup log, tidak ubah apiStatus utama
+    Serial.printf("[STATUS] Gagal, code: %d\n", code);
+  }
+
+  http.end();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// API — POST /sensor
 // ═══════════════════════════════════════════════════════════════════════════
 bool sendToAPI() {
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -242,6 +323,8 @@ bool sendToAPI() {
           lastLabel      = res["classification"]["label"].as<String>();
           lastConfidence = res["classification"]["confidence"].as<float>();
         }
+
+        // Sinkronisasi pump dan mode dari respons /sensor
         if (!res["pump_status"].isNull())
           setPump(res["pump_status"].as<bool>());
 
@@ -255,6 +338,7 @@ bool sendToAPI() {
           String blocked = res["auto_info"]["blocked_reason"].as<String>();
           bool   raining = res["auto_info"]["is_raining"].as<bool>();
           int    rscore  = res["auto_info"]["rain_score"].as<int>();
+          manualOverride = res["auto_info"]["manual_override"] | false;
 
           if (reason.length()  > 0) Serial.printf("[AUTO] %s\n", reason.c_str());
           if (blocked.length() > 0) Serial.printf("[BLOKIR] %s\n", blocked.c_str());
@@ -295,60 +379,6 @@ bool sendToAPI() {
   return success;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// API — /control  (dengan X-API-Key header)
-// ═══════════════════════════════════════════════════════════════════════════
-void sendControlToAPI(bool on, Mode requestedMode) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (ESP.getFreeHeap() < 30000) return;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(15);
-
-  HTTPClient http;
-  http.setTimeout(12000);
-  http.begin(client, String(API_BASE_URL) + "/control");
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", API_KEY);
-
-  JsonDocument doc;
-  doc["action"] = on ? "on" : "off";
-  doc["mode"]   = (requestedMode == MANUAL) ? "manual" : "auto";
-
-  String body;
-  serializeJson(doc, body);
-  Serial.printf("[CONTROL] POST: %s\n", body.c_str());
-
-  int code = http.POST(body);
-
-  if (code == 200) {
-    String response = http.getString();
-    JsonDocument res;
-    if (!deserializeJson(res, response)) {
-      if (!res["pump_status"].isNull()) {
-        bool serverPump = res["pump_status"].as<bool>();
-        if (serverPump != pumpOn) {
-          setPump(serverPump);
-          Serial.printf("[CONTROL] Server koreksi pompa → %s\n", serverPump ? "ON" : "OFF");
-        }
-      }
-      if (!res["mode"].isNull()) {
-        String sMode = res["mode"].as<String>();
-        mode = (sMode == "auto") ? AUTO : MANUAL;
-      }
-      bool debounced = res["debounced"] | false;
-      if (debounced) Serial.println("[CONTROL] Perintah duplikat diabaikan server.");
-      apiStatus = API_OK;
-    }
-  } else if (code == 401) {
-    apiStatus = API_AUTH_ERR;
-    Serial.println("[CONTROL] 401 UNAUTHORIZED — periksa API_KEY!");
-  } else {
-    Serial.printf("[CONTROL] Gagal, code: %d\n", code);
-  }
-  http.end();
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DISPLAY
@@ -372,6 +402,7 @@ void updateDisplay() {
   display.setCursor(2, 2);
   display.print(timeStr);
 
+  // Indikator API di kanan header
   display.setCursor(100, 2);
   switch (apiStatus) {
     case API_OK:       display.print("OK");  break;
@@ -406,15 +437,21 @@ void updateDisplay() {
   // ── 5. Mode & Status Pompa ────────────────────────────────────────────
   display.setCursor(2, 43);
   display.print(mode == AUTO ? "AUTO" : "MAN");
-  display.print("|Pmp:");
-  if (pumpOn) {
-    display.fillRect(72, 42, 54, 9, WHITE);
-    display.setTextColor(BLACK);
-    display.setCursor(76, 43);
-    display.print("ON  ");
-    display.setTextColor(WHITE);
+
+  // [v6.2.0] Tampilkan indikator override jika aktif
+  if (manualOverride && mode == AUTO) {
+    display.print("|OVR");
   } else {
-    display.print("OFF");
+    display.print("|Pmp:");
+    if (pumpOn) {
+      display.fillRect(72, 42, 54, 9, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(76, 43);
+      display.print("ON  ");
+      display.setTextColor(WHITE);
+    } else {
+      display.print("OFF");
+    }
   }
 
   // ── 6. Label KNN ──────────────────────────────────────────────────────
@@ -437,31 +474,6 @@ void updateDisplay() {
   display.display();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// BUTTON
-// ═══════════════════════════════════════════════════════════════════════════
-void checkButton() {
-  bool      state = digitalRead(BTN_PIN);
-  unsigned long now = millis();
-
-  if (state == LOW && lastBtnState == HIGH && (now - lastBtnTime) > DEBOUNCE_MS) {
-    lastBtnTime = now;
-    mode = MANUAL;
-    setPump(!pumpOn);
-    sendControlToAPI(pumpOn, MANUAL);
-    Serial.printf("[BTN] Toggle pompa → %s (MANUAL)\n", pumpOn ? "ON" : "OFF");
-  }
-
-  if (state == LOW && lastBtnState == LOW &&
-      (now - lastBtnTime) > 2000 && mode == MANUAL) {
-    lastBtnTime = now;
-    mode = AUTO;
-    Serial.println("[BTN] Tahan → kembali AUTO");
-    sendControlToAPI(pumpOn, AUTO);
-  }
-
-  lastBtnState = state;
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SETUP
@@ -469,19 +481,18 @@ void checkButton() {
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
-  Serial.println("\n=== SIRAM PINTAR v6 BOOTING ===");
+  Serial.println("\n=== SIRAM PINTAR ESP32 v" FW_VERSION " BOOTING ===");
   Serial.printf("[AUTH] API Key: %s\n", API_KEY);
 
+  // Inisialisasi relay — mulai dalam kondisi OFF
   pinMode(RELAY_PIN, OUTPUT);
-  // DIUBAH: kondisi awal relay menggunakan RELAY_OFF (LOW)
-  // Kode lama: digitalWrite(RELAY_PIN, HIGH) — sama artinya tapi tidak konsisten
-  // Kode baru: pakai konstanta RELAY_OFF agar jelas dan konsisten
   digitalWrite(RELAY_PIN, RELAY_OFF);
 
+  // ADC untuk soil moisture
   analogSetAttenuation(ADC_11db);
   analogReadResolution(12);
-  pinMode(BTN_PIN, INPUT_PULLUP);
 
+  // I2C & OLED
   dht.begin();
   Wire.begin();
   Wire.setClock(400000);
@@ -491,18 +502,22 @@ void setup() {
     while (true) delay(1000);
   }
 
+  // Splash screen
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.setTextSize(1);
-  display.setCursor(18, 8);  display.println("SIRAM PINTAR");
-  display.setCursor(12, 22); display.println("IoT + KNN v6");
-  display.setCursor(20, 38); display.println("Memuat...");
+  display.setCursor(14, 4);  display.println("SIRAM PINTAR");
+  display.setCursor(14, 16); display.println("IoT + KNN");
+  display.setCursor(14, 28); display.print("Firmware v"); display.println(FW_VERSION);
+  display.setCursor(14, 42); display.println("Memuat...");
   display.display();
   delay(1500);
 
+  // Koneksi WiFi & NTP
   wifiConnected = connectWiFi();
   if (wifiConnected) syncNTP();
 
+  // Baca sensor awal
   delay(2000);
   for (int i = 0; i < 5; i++) {
     temperature = dht.readTemperature();
@@ -510,13 +525,16 @@ void setup() {
     if (!isnan(temperature) && !isnan(airHumidity)) break;
     delay(500);
   }
-
   soilRaw = readSoilADC();
   soilPct = constrain(map(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100), 0, 100);
-  delay(500);
 
-  if (wifiConnected) sendToAPI();
+  // Kirim data awal ke server & langsung poll status
+  if (wifiConnected) {
+    sendToAPI();
+    checkPumpStatus();
+  }
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LOOP
@@ -524,10 +542,19 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  checkButton();
   handleWiFiReconnect();
 
-  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+  // [v6.2.0] Poll /pump-status setiap 5 detik untuk respons cepat
+  // Ini yang menggantikan fungsi tombol fisik:
+  // kontrol dari Postman/dashboard akan terdeteksi dalam max 5 detik.
+  if (now - lastStatusCheck >= STATUS_INTERVAL) {
+    lastStatusCheck = now;
+    wifiConnected   = (WiFi.status() == WL_CONNECTED);
+    if (wifiConnected) checkPumpStatus();
+  }
+
+  // Baca sensor setiap 2 detik (lokal, tidak kirim ke server)
+  if (now - lastSensorRead >= 2000UL) {
     lastSensorRead = now;
     float t = dht.readTemperature();
     float h = dht.readHumidity();
@@ -536,21 +563,24 @@ void loop() {
     soilRaw = readSoilADC();
     soilPct = constrain(map(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100), 0, 100);
 
+    // Fallback offline: jika WiFi mati, gunakan threshold lokal
     if (mode == AUTO && WiFi.status() != WL_CONNECTED) {
       if (!pumpOn && soilPct <= 40.0f) setPump(true);
       else if (pumpOn && soilPct >= 70.0f) setPump(false);
     }
   }
 
-  if (now - lastApiSend >= API_INTERVAL) {
-    lastApiSend   = now;
-    wifiConnected = (WiFi.status() == WL_CONNECTED);
+  // Kirim data sensor ke /sensor setiap 30 detik
+  if (now - lastSensorRead >= SENSOR_INTERVAL) {
+    lastSensorRead = now;
+    wifiConnected  = (WiFi.status() == WL_CONNECTED);
     if (wifiConnected) sendToAPI();
   }
 
+  // Refresh OLED setiap 1 detik
   if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
     lastDisplayUpdate = now;
-    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    wifiConnected     = (WiFi.status() == WL_CONNECTED);
     updateDisplay();
   }
 
