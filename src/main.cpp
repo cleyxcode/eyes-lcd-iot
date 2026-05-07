@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -16,94 +15,97 @@
 #include <DNSServer.h>
 #include "wifi_portal.h"
 
-// ── Konfigurasi Dinamis (diambil dari Preferences) ─────────────────────────
+// ── Konfigurasi ─────────────────────────────────────────────────────────────
 String wifi_ssid = "";
 String wifi_pass = "";
 String api_url   = "https://ml-api-supabase.vercel.app";
 
 #define API_KEY      "yuli1"
-#define FW_VERSION   "6.3.1-fix"
+#define FW_VERSION   "6.4.0"   // versi perbaikan tampilan OVR
 
-// ── Pin ───────────────────────────────────────────────────────────────────
+// ── Pin ───────────────────────────────────────────────────────────────────────
 #define RELAY_PIN  25
 #define DHT_PIN     4
 #define SOIL_PIN   35
 
-// Logika relay: aktif HIGH
 #define RELAY_ON   HIGH
 #define RELAY_OFF  LOW
 
-// ── OLED ──────────────────────────────────────────────────────────────────
+// ── OLED ─────────────────────────────────────────────────────────────────────
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ── DHT22 ─────────────────────────────────────────────────────────────────
+// ── DHT22 ────────────────────────────────────────────────────────────────────
 DHT dht(DHT_PIN, DHT22);
 
-// ── Soil Moisture kalibrasi ───────────────────────────────────────────────
+// ── Soil Moisture kalibrasi ───────────────────────────────────────────────────
 #define SOIL_DRY_ADC 2800
 #define SOIL_WET_ADC 1200
 #define SOIL_SAMPLES   10
 
-// ── NTP (WIT = UTC+9) ─────────────────────────────────────────────────────
+// ── NTP (WIT = UTC+9) ────────────────────────────────────────────────────────
 const char* ntpServer          = "pool.ntp.org";
 const long  gmtOffset_sec      = 9 * 3600;
 const int   daylightOffset_sec = 0;
 
-// ── Timing ────────────────────────────────────────────────────────────────
-const unsigned long SENSOR_READ_INTERVAL = 2000UL;   // baca sensor lokal (2 detik)
-const unsigned long SENSOR_SEND_INTERVAL = 30000UL;  // kirim data ke /sensor (30 detik)
-const unsigned long STATUS_INTERVAL      = 5000UL;   // poll /pump-status (5 detik)
-const unsigned long DISPLAY_INTERVAL     = 1000UL;   // refresh OLED (1 detik)
-const unsigned long WIFI_CHECK_MS        = 10000UL;  // cek koneksi WiFi
+// ── Timing ───────────────────────────────────────────────────────────────────
+const unsigned long SENSOR_READ_INTERVAL = 2000UL;    // baca sensor lokal (2 detik)
+const unsigned long SENSOR_SEND_INTERVAL = 30000UL;   // kirim ke /sensor (30 detik)
+const unsigned long STATUS_INTERVAL      = 5000UL;    // poll /pump-status (5 detik)
+const unsigned long DISPLAY_INTERVAL     = 1000UL;    // refresh OLED (1 detik)
+const unsigned long WIFI_CHECK_MS        = 10000UL;   // cek koneksi WiFi
 const unsigned long NTP_RESYNC_MS        = 3600000UL; // resync NTP tiap 1 jam
 
-
 unsigned long lastSensorRead    = 0;
-unsigned long lastSensorSend    = 0;  // [FIX] variabel baru khusus timer kirim
+unsigned long lastSensorSend    = 0;
 unsigned long lastStatusCheck   = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastWiFiCheck     = 0;
 unsigned long lastNtpSync       = 0;
 
-// ── Mode operasi ──────────────────────────────────────────────────────────
+// ── Mode operasi ─────────────────────────────────────────────────────────────
 enum Mode { AUTO, MANUAL };
 Mode mode = AUTO;
 
-// ── State ─────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 bool   pumpOn         = false;
 bool   wifiConnected  = false;
 bool   ntpSynced      = false;
 bool   manualOverride = false;
 
+// [FIX] Tambahan: waktu sisa OVR untuk ditampilkan di LCD
+unsigned long ovrStartMs  = 0;          // kapan OVR mulai
+const unsigned long OVR_DURATION = 600000UL; // 600 detik = 10 menit
+
 enum ApiStatus { API_UNKNOWN, API_OK, API_AUTH_ERR, API_ERR };
-ApiStatus    apiStatus     = API_UNKNOWN;
+ApiStatus     apiStatus      = API_UNKNOWN;
 unsigned long lastApiSuccess = 0;
 
 String lastLabel      = "---";
 float  lastConfidence = 0.0;
 String lastAutoInfo   = "";
+String lastKnnLabel   = "---"; // [FIX] simpan label KNN terpisah untuk display
 
 const char* namaHari[] = {"Mgg","Sen","Sel","Rab","Kam","Jum","Sab"};
 
-// ── Data sensor ───────────────────────────────────────────────────────────
+// ── Data sensor ───────────────────────────────────────────────────────────────
 float temperature = NAN;
 float airHumidity = NAN;
 int   soilRaw     = 0;
 float soilPct     = 0.0;
 
-// ── Portal State ──────────────────────────────────────────────────────────
+// ── Portal State ──────────────────────────────────────────────────────────────
 WebServer  server(80);
 DNSServer  dnsServer;
 Preferences prefs;
 bool isPortalMode = false;
 
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // UTILITAS
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 int readSoilADC() {
   long sum = 0;
   for (int i = 0; i < SOIL_SAMPLES; i++) {
@@ -123,10 +125,18 @@ void setPump(bool on) {
                 soilPct);
 }
 
+// [FIX] Hitung sisa waktu OVR dalam detik
+int ovrRemainingSeconds() {
+  if (!manualOverride) return 0;
+  unsigned long elapsed = millis() - ovrStartMs;
+  if (elapsed >= OVR_DURATION) return 0;
+  return (int)((OVR_DURATION - elapsed) / 1000UL);
+}
 
-// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // WIFI & NTP
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 void syncNTP() {
   Serial.println("[NTP] Sinkronisasi waktu WIT...");
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -147,11 +157,10 @@ void loadSettings() {
   prefs.begin("siram-pintar", false);
   wifi_ssid = prefs.getString("ssid", "");
   wifi_pass = prefs.getString("pass", "");
-  // Hapus kredensial dari NVS setelah dibaca (volatile — tidak permanen)
   prefs.remove("ssid");
   prefs.remove("pass");
   prefs.end();
-  Serial.println("[PREFS] WiFi settings loaded into RAM and cleared from NVS (Volatile).");
+  Serial.println("[PREFS] WiFi settings loaded dan cleared dari NVS.");
 }
 
 void saveSettings(String s, String p) {
@@ -159,7 +168,7 @@ void saveSettings(String s, String p) {
   prefs.putString("ssid", s);
   prefs.putString("pass", p);
   prefs.end();
-  Serial.println("[PREFS] Temporary WiFi settings saved for next boot.");
+  Serial.println("[PREFS] WiFi settings disimpan sementara.");
 }
 
 bool connectWiFi() {
@@ -226,16 +235,19 @@ void startPortal() {
     String p = server.arg("password");
     if (s != "") {
       saveSettings(s, p);
-      server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"WiFi Disimpan! Restarting...\"}");
+      server.send(200, "application/json",
+                  "{\"status\":\"ok\",\"message\":\"WiFi Disimpan! Restarting...\"}");
       delay(2000);
       ESP.restart();
     } else {
-      server.send(400, "application/json", "{\"status\":\"err\",\"message\":\"SSID wajib diisi!\"}");
+      server.send(400, "application/json",
+                  "{\"status\":\"err\",\"message\":\"SSID wajib diisi!\"}");
     }
   });
 
   server.onNotFound([]() {
-    server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
+    server.sendHeader("Location",
+                      String("http://") + WiFi.softAPIP().toString(), true);
     server.send(302, "text/plain", "");
   });
 
@@ -273,9 +285,9 @@ void handleWiFiReconnect() {
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════
-// API — GET /pump-status (polling ringan setiap 5 detik)
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// API — GET /pump-status (polling setiap 5 detik)
+// ═══════════════════════════════════════════════════════════════════════════════
 void checkPumpStatus() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (ESP.getFreeHeap() < 25000) {
@@ -299,21 +311,30 @@ void checkPumpStatus() {
     JsonDocument res;
 
     if (!deserializeJson(res, response)) {
-      bool   serverPump = res["pump_status"] | pumpOn;
-      String sMode      = res["mode"] | (mode == AUTO ? "auto" : "manual");
-      bool   overrideOn = res["manual_override"] | false;
+      bool   serverPump  = res["pump_status"]    | pumpOn;
+      String sMode       = res["mode"]           | (mode == AUTO ? "auto" : "manual");
+      bool   overrideNow = res["manual_override"] | false;
+
+      // [FIX] Deteksi transisi manualOverride false→true untuk catat waktu mulai
+      if (overrideNow && !manualOverride) {
+        ovrStartMs = millis();
+        Serial.println("[OVR] Manual override aktif — timer 10 menit dimulai.");
+      }
+      if (!overrideNow && manualOverride) {
+        Serial.println("[OVR] Manual override selesai — KNN aktif kembali.");
+      }
+      manualOverride = overrideNow;
 
       Mode newMode = (sMode == "auto") ? AUTO : MANUAL;
       if (newMode != mode) {
         mode = newMode;
-        Serial.printf("[STATUS] Mode berubah → %s\n", mode == AUTO ? "AUTO" : "MANUAL");
+        Serial.printf("[STATUS] Mode berubah → %s\n",
+                      mode == AUTO ? "AUTO" : "MANUAL");
       }
-
-      manualOverride = overrideOn;
 
       if (serverPump != pumpOn) {
         setPump(serverPump);
-        Serial.printf("[STATUS] pump_status sinkron dari server → %s\n",
+        Serial.printf("[STATUS] pump_status sinkron → %s\n",
                       serverPump ? "ON" : "OFF");
       }
 
@@ -332,9 +353,9 @@ void checkPumpStatus() {
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // API — POST /sensor (dikirim setiap 30 detik)
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 bool sendToAPI() {
   if (WiFi.status() != WL_CONNECTED) return false;
   if (ESP.getFreeHeap() < 30000) {
@@ -378,9 +399,12 @@ bool sendToAPI() {
       JsonDocument res;
 
       if (!deserializeJson(res, response)) {
+
+        // [FIX] Simpan label KNN terpisah
         if (!res["classification"]["label"].isNull()) {
           lastLabel      = res["classification"]["label"].as<String>();
           lastConfidence = res["classification"]["confidence"].as<float>();
+          lastKnnLabel   = lastLabel; // simpan untuk display
         }
 
         if (!res["pump_status"].isNull())
@@ -396,7 +420,17 @@ bool sendToAPI() {
           String blocked = res["auto_info"]["blocked_reason"].as<String>();
           bool   raining = res["auto_info"]["is_raining"].as<bool>();
           int    rscore  = res["auto_info"]["rain_score"].as<int>();
-          manualOverride = res["auto_info"]["manual_override"] | false;
+
+          // [FIX] Update manualOverride dari response /sensor juga
+          bool overrideNow = res["auto_info"]["manual_override"] | false;
+          if (overrideNow && !manualOverride) {
+            ovrStartMs = millis();
+            Serial.println("[OVR] Manual override aktif (dari /sensor).");
+          }
+          if (!overrideNow && manualOverride) {
+            Serial.println("[OVR] Manual override selesai (dari /sensor).");
+          }
+          manualOverride = overrideNow;
 
           if (reason.length()  > 0) Serial.printf("[AUTO] %s\n", reason.c_str());
           if (blocked.length() > 0) Serial.printf("[BLOKIR] %s\n", blocked.c_str());
@@ -416,7 +450,7 @@ bool sendToAPI() {
       apiStatus      = API_OK;
       lastApiSuccess = millis();
       success        = true;
-      Serial.printf("[API] OK | Pompa: %s | Label: %s (%.0f%%)\n",
+      Serial.printf("[API] OK | Pompa: %s | KNN: %s (%.0f%%)\n",
                     pumpOn ? "ON" : "OFF", lastLabel.c_str(), lastConfidence);
 
     } else if (code == 401) {
@@ -424,7 +458,6 @@ bool sendToAPI() {
       Serial.printf("[API] 401 UNAUTHORIZED — periksa API_KEY '%s'\n", API_KEY);
       http.end();
       break;
-
     } else {
       apiStatus = API_ERR;
       Serial.printf("[API] Gagal attempt %d, code: %d\n", attempt, code);
@@ -438,9 +471,24 @@ bool sendToAPI() {
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════
-// DISPLAY
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPLAY — DIPERBAIKI
+// Layout LCD 128x64:
+// ┌─────────────────────────────┐  y=0
+// │ Sen 06:30          OK       │  Header (y=0-11)
+// ├─────────────────────────────┤  y=12
+// │ T:29.0C    RH:55%           │  Suhu & Kelembaban udara (y=13-22)
+// ├─────────────────────────────┤  y=23
+// │ Tanah: 22.0%                │  Kelembaban tanah (y=24-32)
+// ├─────────────────────────────┤  y=33
+// │ ▓▓▓▓▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  │  Progress bar tanah (y=34-39)
+// ├─────────────────────────────┤  y=40
+// │ AUTO | Pmp: ON              │  Mode & Pompa (y=41-49)
+// │ [OVR 8m32s] — saat override │  Info OVR (y=41-49, menggantikan baris atas)
+// ├─────────────────────────────┤  y=50
+// │ SiramSeg 100%      ●        │  Label KNN & indikator API (y=52-63)
+// └─────────────────────────────┘  y=64
+// ═══════════════════════════════════════════════════════════════════════════════
 void updateDisplay() {
   display.clearDisplay();
 
@@ -448,82 +496,143 @@ void updateDisplay() {
   bool hasTime = ntpSynced && getLocalTime(&timeinfo);
   char timeStr[16];
   if (hasTime)
-    sprintf(timeStr, "%s %02d:%02d", namaHari[timeinfo.tm_wday],
+    sprintf(timeStr, "%s %02d:%02d",
+            namaHari[timeinfo.tm_wday],
             timeinfo.tm_hour, timeinfo.tm_min);
   else
     strcpy(timeStr, "No NTP");
 
-  // ── 1. Header bar ──────────────────────────────────────────────────────
+  // ── 1. Header bar ──────────────────────────────────────────────────────────
   display.fillRect(0, 0, 128, 12, WHITE);
   display.setTextColor(BLACK);
   display.setTextSize(1);
   display.setCursor(2, 2);
   display.print(timeStr);
 
-  display.setCursor(100, 2);
+  // Status koneksi di header (kanan atas)
+  display.setCursor(96, 2);
   switch (apiStatus) {
-    case API_OK:       display.print("OK");  break;
-    case API_AUTH_ERR: display.print("401"); break;
-    case API_ERR:      display.print("ERR"); break;
-    default:           display.print(wifiConnected ? "W" : "--"); break;
+    case API_OK:       display.print(" OK");  break;
+    case API_AUTH_ERR: display.print("401");  break;
+    case API_ERR:      display.print("ERR");  break;
+    default:           display.print(wifiConnected ? " W" : "--"); break;
   }
 
-  // ── 2. Suhu & RH ──────────────────────────────────────────────────────
+  // ── 2. Suhu & Kelembaban Udara ─────────────────────────────────────────────
   display.setTextColor(WHITE);
-  display.setCursor(2, 15);
+  display.setCursor(2, 14);
   display.print("T:");
   if (isnan(temperature)) display.print("ERR");
   else { display.print(temperature, 1); display.print("C"); }
 
-  display.setCursor(68, 15);
+  display.setCursor(68, 14);
   display.print("RH:");
   if (isnan(airHumidity)) display.print("ERR");
   else { display.print(airHumidity, 0); display.print("%"); }
 
-  // ── 3. Tanah ──────────────────────────────────────────────────────────
-  display.setCursor(2, 25);
+  // ── 3. Kelembaban Tanah ────────────────────────────────────────────────────
+  display.setCursor(2, 24);
   display.print("Tanah:");
   display.print(soilPct, 1);
   display.print("%");
 
-  // ── 4. Progress bar tanah ─────────────────────────────────────────────
-  display.drawRect(0, 34, 128, 6, WHITE);
+  // ── 4. Progress bar tanah ──────────────────────────────────────────────────
+  display.drawRect(0, 33, 128, 7, WHITE);
   int fillW = (int)map(constrain((long)soilPct, 0, 100), 0, 100, 0, 124);
-  if (fillW > 0) display.fillRect(2, 36, fillW, 2, WHITE);
+  if (fillW > 0) display.fillRect(2, 35, fillW, 3, WHITE);
 
-  // ── 5. Mode & Status Pompa ────────────────────────────────────────────
-  display.setCursor(2, 43);
-  display.print(mode == AUTO ? "AUTO" : "MAN");
+  // ── 5. Mode, Status Pompa & OVR ───────────────────────────────────────────
+  // [FIX] Tampilan diperbaiki — OVR ditampilkan sebagai info tambahan,
+  //        status pompa (ON/OFF) SELALU tampil tidak peduli kondisi apapun.
 
-  if (manualOverride && mode == AUTO) {
-    display.print("|OVR");
+  display.setCursor(2, 42);
+
+  if (mode == AUTO) {
+    // ── Mode AUTO ─────────────────────────────────────────────────────────
+    if (manualOverride) {
+      // OVR aktif: tampilkan sisa waktu + status pompa
+      int sisaDetik = ovrRemainingSeconds();
+      int sisaMenit = sisaDetik / 60;
+      int sisaSek   = sisaDetik % 60;
+
+      // Baris atas: [OVR Xm Ys]
+      display.print("OVR ");
+      display.print(sisaMenit);
+      display.print("m");
+      display.print(sisaSek);
+      display.print("s");
+
+      // Baris bawah (y=52): status pompa tetap tampil
+      display.setCursor(2, 52);
+      display.print("AUTO|Pmp:");
+      if (pumpOn) {
+        // Pompa ON — highlight dengan kotak putih
+        display.fillRect(70, 51, 40, 9, WHITE);
+        display.setTextColor(BLACK);
+        display.setCursor(74, 52);
+        display.print("ON ");
+        display.setTextColor(WHITE);
+      } else {
+        display.print("OFF");
+      }
+
+    } else {
+      // Normal AUTO — tidak ada OVR
+      display.print("AUTO|Pmp:");
+      if (pumpOn) {
+        display.fillRect(70, 41, 40, 9, WHITE);
+        display.setTextColor(BLACK);
+        display.setCursor(74, 42);
+        display.print("ON ");
+        display.setTextColor(WHITE);
+      } else {
+        display.print("OFF");
+      }
+
+      // Label KNN di baris bawah
+      display.setCursor(2, 52);
+      // Potong label agar muat (max 10 karakter)
+      String shortLabel = lastKnnLabel;
+      if (shortLabel.length() > 10) shortLabel = shortLabel.substring(0, 10);
+      display.print(shortLabel);
+      display.print(" ");
+      display.print((int)lastConfidence);
+      display.print("%");
+    }
+
   } else {
-    display.print("|Pmp:");
+    // ── Mode MANUAL ───────────────────────────────────────────────────────
+    display.print("MAN |Pmp:");
     if (pumpOn) {
-      display.fillRect(72, 42, 54, 9, WHITE);
+      display.fillRect(70, 41, 40, 9, WHITE);
       display.setTextColor(BLACK);
-      display.setCursor(76, 43);
-      display.print("ON  ");
+      display.setCursor(74, 42);
+      display.print("ON ");
       display.setTextColor(WHITE);
     } else {
       display.print("OFF");
     }
+
+    // Label KNN di baris bawah (tetap tampil di mode manual)
+    display.setCursor(2, 52);
+    String shortLabel = lastKnnLabel;
+    if (shortLabel.length() > 10) shortLabel = shortLabel.substring(0, 10);
+    display.print(shortLabel);
+    display.print(" ");
+    display.print((int)lastConfidence);
+    display.print("%");
   }
 
-  // ── 6. Label KNN ──────────────────────────────────────────────────────
-  display.setCursor(2, 54);
-  display.print(lastLabel.substring(0, 7));
-  display.print(" ");
-  display.print((int)lastConfidence);
-  display.print("%");
-
-  // ── 7. Indikator koneksi API (pojok kanan bawah) ──────────────────────
+  // ── 6. Indikator koneksi API (pojok kanan bawah) ──────────────────────────
   if (apiStatus == API_OK) {
+    // Lingkaran penuh = OK
     display.fillCircle(123, 58, 3, WHITE);
   } else if (apiStatus == API_AUTH_ERR) {
+    // Tanda X = auth error
     display.drawLine(119, 54, 127, 62, WHITE);
     display.drawLine(127, 54, 119, 62, WHITE);
   } else {
+    // Lingkaran kosong = error lain / unknown
     display.drawCircle(123, 58, 3, WHITE);
   }
 
@@ -531,9 +640,9 @@ void updateDisplay() {
 }
 
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 // SETUP
-// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
 void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   Serial.begin(115200);
@@ -559,9 +668,10 @@ void setup() {
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.setTextSize(1);
-  display.setCursor(14, 4);  display.println("SIRAM PINTAR");
+  display.setCursor(14,  4); display.println("SIRAM PINTAR");
   display.setCursor(14, 16); display.println("IoT + KNN");
-  display.setCursor(14, 28); display.print("Firmware v"); display.println(FW_VERSION);
+  display.setCursor(14, 28); display.print("Firmware v");
+  display.println(FW_VERSION);
   display.setCursor(14, 42); display.println("Memuat...");
   display.display();
   delay(1500);
@@ -594,10 +704,15 @@ void setup() {
   }
 
   unsigned long now = millis();
-  lastSensorRead = now;
-  lastSensorSend = now;
+  lastSensorRead  = now;
+  lastSensorSend  = now;
+  lastStatusCheck = now;
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOOP
+// ═══════════════════════════════════════════════════════════════════════════════
 void loop() {
   if (isPortalMode) {
     dnsServer.processNextRequest();
@@ -609,12 +724,14 @@ void loop() {
 
   handleWiFiReconnect();
 
+  // Poll /pump-status setiap 5 detik
   if (now - lastStatusCheck >= STATUS_INTERVAL) {
     lastStatusCheck = now;
     wifiConnected   = (WiFi.status() == WL_CONNECTED);
     if (wifiConnected) checkPumpStatus();
   }
 
+  // Baca sensor lokal setiap 2 detik
   if (now - lastSensorRead >= SENSOR_READ_INTERVAL) {
     lastSensorRead = now;
 
@@ -625,18 +742,21 @@ void loop() {
     soilRaw = readSoilADC();
     soilPct = constrain(map(soilRaw, SOIL_DRY_ADC, SOIL_WET_ADC, 0, 100), 0, 100);
 
+    // Fallback lokal jika WiFi putus (mode AUTO)
     if (mode == AUTO && WiFi.status() != WL_CONNECTED) {
       if (!pumpOn && soilPct <= 40.0f) setPump(true);
       else if (pumpOn && soilPct >= 70.0f) setPump(false);
     }
   }
 
+  // Kirim data ke /sensor setiap 30 detik
   if (now - lastSensorSend >= SENSOR_SEND_INTERVAL) {
     lastSensorSend = now;
     wifiConnected  = (WiFi.status() == WL_CONNECTED);
     if (wifiConnected) sendToAPI();
   }
 
+  // Update OLED setiap 1 detik
   if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
     lastDisplayUpdate = now;
     wifiConnected     = (WiFi.status() == WL_CONNECTED);
